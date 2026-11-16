@@ -3,6 +3,11 @@
 import type { StreamDownloadOptions, StreamDownloadWriter } from './types';
 import { createOpfsDownload, isIOSWebKit, isOpfsAvailable } from './opfs';
 
+/** Bytes the page may be ahead of the browser before write() waits. */
+const HIGH_WATER_BYTES = 16 * 1024 * 1024;
+/** How long write() and close() wait without a word from the worker before carrying on. */
+const STALL_MS = 30_000;
+
 /**
  * Detects if running in a browser extension context
  */
@@ -124,7 +129,7 @@ export async function createStreamingDownload(
     // Works for web apps (SW registered via setupStreamingDownloads) and
     // browser extensions where the background script calls setupStreamingDownloads().
     navigator.serviceWorker.controller.postMessage(
-      { filename, size },
+      { filename, size, ack: true },
       [channel.port2]
     );
   } else if (allowStream && !forceBlob && isExtensionContext() && typeof navigator.serviceWorker !== 'undefined') {
@@ -146,7 +151,7 @@ export async function createStreamingDownload(
 
     // Send initialization message to bridge iframe
     bridgeIframe.contentWindow!.postMessage(
-      { filename, size },
+      { filename, size, ack: true },
       '*',
       [channel.port2]
     );
@@ -154,10 +159,15 @@ export async function createStreamingDownload(
     return createBlobDownload(filename, onProgress);
   }
 
-  // Wait for download URL from service worker
+  // Wait for download URL from service worker. A worker that can report
+  // how much the browser has taken answers with `ack: true`; an older
+  // worker (a registration left from a previous version) does not, and
+  // the writer then behaves as it always did.
+  let acked = false;
   const downloadUrl = await new Promise<string>((resolve, reject) => {
     downloadPort.onmessage = (event) => {
       if (event.data.download) {
+        acked = event.data.ack === true;
         resolve(event.data.download);
       } else if (event.data.error) {
         reject(new Error(event.data.error));
@@ -166,6 +176,49 @@ export async function createStreamingDownload(
 
     setTimeout(() => reject(new Error('Failed to get download URL from service worker')), 5000);
   });
+
+  // Bytes the browser has taken from the worker, and whether it has them all.
+  let consumed = 0;
+  let done = false;
+  let cancelled = false;
+  let onAck: (() => void) | null = null;
+  if (acked) {
+    downloadPort.onmessage = (event) => {
+      const data = event.data;
+      if (!data) return;
+      if (typeof data.consumed === 'number') consumed = data.consumed;
+      if (data.done) done = true;
+      if (data.abort) cancelled = true;
+      onAck?.();
+    };
+  }
+
+  /**
+   * Resolves when `ready()` is true. Gives up when the worker has said
+   * nothing for STALL_MS, and turns the waiting off for the rest of this
+   * download, so a worker that went away can never hang the caller.
+   */
+  const waitFor = (ready: () => boolean): Promise<void> =>
+    new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const finish = () => {
+        clearTimeout(timer);
+        onAck = null;
+        resolve();
+      };
+      const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          acked = false;
+          finish();
+        }, STALL_MS);
+      };
+      onAck = () => {
+        if (cancelled || ready()) finish();
+        else arm();
+      };
+      arm();
+    });
 
   // Trigger download via a hidden iframe navigating to the download URL.
   // The URL is within the SW's scope, so the SW intercepts the
@@ -192,6 +245,11 @@ export async function createStreamingDownload(
       if (onProgress) {
         onProgress(bytesWritten);
       }
+
+      // The disk is behind: wait here so the data does not pile up in memory.
+      if (acked && !cancelled && bytesWritten - consumed > HIGH_WATER_BYTES) {
+        await waitFor(() => bytesWritten - consumed <= HIGH_WATER_BYTES);
+      }
     },
 
     async close(): Promise<void> {
@@ -201,6 +259,11 @@ export async function createStreamingDownload(
 
       closed = true;
       downloadPort.postMessage('end');
+
+      // Resolve only when the browser has taken the last byte.
+      if (acked && !cancelled && !done) {
+        await waitFor(() => done);
+      }
       downloadPort.close();
 
       // Clean up bridge iframe if used (extension context)

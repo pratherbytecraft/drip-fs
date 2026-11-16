@@ -4,6 +4,92 @@ import type { BackgroundSetupOptions, DownloadMetadata } from './types';
 
 declare const self: ServiceWorkerGlobalScope;
 
+/** Bytes the browser may take between two progress reports to the page. */
+const ACK_EVERY_BYTES = 1024 * 1024;
+
+/**
+ * A stream that hands the browser one chunk each time it asks for one,
+ * and tells the page how many bytes the browser has taken so far
+ * (`{ consumed }`) and when it has taken the last one (`{ done: true }`).
+ * The page uses that to hold its writes while the disk is behind, and
+ * to end close() only when the download has all of its data.
+ */
+export function createAckedStream(
+  port: MessagePort,
+  log: (...args: unknown[]) => void = () => {}
+): ReadableStream<Uint8Array> {
+  const queue: Uint8Array[] = [];
+  let ended = false;
+  let finished = false;
+  let consumed = 0;
+  let reported = 0;
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let waiting: (() => void) | null = null;
+
+  const settle = () => {
+    const resolve = waiting;
+    waiting = null;
+    if (resolve) resolve();
+  };
+
+  const pump = () => {
+    if (!waiting || finished || !controller) return;
+    if (queue.length > 0) {
+      const chunk = queue.shift()!;
+      consumed += chunk.byteLength;
+      controller.enqueue(chunk);
+      if (queue.length === 0 || consumed - reported >= ACK_EVERY_BYTES) {
+        reported = consumed;
+        port.postMessage({ consumed });
+      }
+      settle();
+    } else if (ended) {
+      finished = true;
+      log('Stream ended');
+      controller.close();
+      port.postMessage({ consumed, done: true });
+      settle();
+    }
+  };
+
+  return new ReadableStream<Uint8Array>(
+    {
+      start(c) {
+        controller = c;
+        port.onmessage = ({ data: messageData }) => {
+          if (finished) return;
+          if (messageData === 'end') {
+            ended = true;
+          } else if (messageData === 'abort') {
+            finished = true;
+            queue.length = 0;
+            log('Stream aborted');
+            c.error('Download aborted');
+            settle();
+            return;
+          } else {
+            queue.push(messageData);
+          }
+          pump();
+        };
+      },
+      pull() {
+        return new Promise<void>((resolve) => {
+          waiting = resolve;
+          pump();
+        });
+      },
+      cancel(reason) {
+        finished = true;
+        queue.length = 0;
+        log('Stream cancelled:', reason);
+        port.postMessage({ abort: true });
+      },
+    },
+    { highWaterMark: 0 }
+  );
+}
+
 /**
  * Sets up streaming download support in a service worker.
  *
@@ -87,6 +173,9 @@ export function setupStreamingDownloads(options: BackgroundSetupOptions = {}): v
       port,
     };
 
+    // A page that asks for it gets progress reports and a wait on its writes
+    const acked = !!(data && (data as { ack?: boolean }).ack);
+
     // Handle different stream transfer methods
     if (event.data.readableStream) {
       metadata.stream = event.data.readableStream;
@@ -95,6 +184,8 @@ export function setupStreamingDownloads(options: BackgroundSetupOptions = {}): v
         port.onmessage = null;
         metadata.stream = evt.data.readableStream;
       };
+    } else if (acked) {
+      metadata.stream = createAckedStream(port, log);
     } else {
       metadata.stream = new ReadableStream({
         start(controller) {
@@ -121,7 +212,7 @@ export function setupStreamingDownloads(options: BackgroundSetupOptions = {}): v
     }
 
     downloadMap.set(downloadUrl, metadata);
-    port.postMessage({ download: downloadUrl });
+    port.postMessage(acked ? { download: downloadUrl, ack: true } : { download: downloadUrl });
   };
 
   // Handle fetch requests for downloads.

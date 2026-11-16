@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { setupStreamingDownloads } from './background';
+import { createAckedStream, setupStreamingDownloads } from './background';
 
 describe('setupStreamingDownloads', () => {
   let installListeners: Array<() => void> = [];
@@ -512,5 +512,59 @@ describe('setupStreamingDownloads', () => {
         debug: 'Download started',
       });
     });
+  });
+});
+
+describe('createAckedStream', () => {
+  const makePort = () => ({ onmessage: null as ((e: { data: unknown }) => void) | null, postMessage: vi.fn() });
+  const send = (port: ReturnType<typeof makePort>, data: unknown) => port.onmessage!({ data });
+
+  it('hands over a chunk only when the reader asks, and reports what was taken', async () => {
+    const port = makePort();
+    const reader = createAckedStream(port as unknown as MessagePort).getReader();
+    send(port, new Uint8Array(3));
+    send(port, new Uint8Array(4));
+    await Promise.resolve();
+    expect(port.postMessage).not.toHaveBeenCalled();
+
+    expect((await reader.read()).value!.byteLength).toBe(3);
+    expect((await reader.read()).value!.byteLength).toBe(4);
+    expect(port.postMessage).toHaveBeenLastCalledWith({ consumed: 7 });
+  });
+
+  it('says done only after the queue is empty and the end arrived', async () => {
+    const port = makePort();
+    const reader = createAckedStream(port as unknown as MessagePort).getReader();
+    send(port, new Uint8Array(5));
+    send(port, 'end');
+    await Promise.resolve();
+    expect(port.postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ done: true }));
+
+    await reader.read();
+    expect((await reader.read()).done).toBe(true);
+    expect(port.postMessage).toHaveBeenLastCalledWith({ consumed: 5, done: true });
+  });
+
+  it('a read that is waiting gets the chunk when it arrives', async () => {
+    const port = makePort();
+    const reader = createAckedStream(port as unknown as MessagePort).getReader();
+    const pending = reader.read();
+    send(port, new Uint8Array(2));
+    expect((await pending).value!.byteLength).toBe(2);
+  });
+
+  it('abort from the page errors the stream', async () => {
+    const port = makePort();
+    const reader = createAckedStream(port as unknown as MessagePort).getReader();
+    const pending = reader.read();
+    send(port, 'abort');
+    await expect(pending).rejects.toBe('Download aborted');
+  });
+
+  it('a cancel by the browser tells the page', async () => {
+    const port = makePort();
+    const reader = createAckedStream(port as unknown as MessagePort).getReader();
+    await reader.cancel('gone');
+    expect(port.postMessage).toHaveBeenCalledWith({ abort: true });
   });
 });

@@ -161,7 +161,7 @@ describe('createStreamingDownload', () => {
       await promise;
 
       expect(mockContentWindow.postMessage).toHaveBeenCalledWith(
-        { filename: 'test.bin', size: 2048 },
+        { filename: 'test.bin', size: 2048, ack: true },
         '*',
         [mockPort2]
       );
@@ -315,7 +315,7 @@ describe('createStreamingDownload', () => {
       await promise;
 
       expect(mockController.postMessage).toHaveBeenCalledWith(
-        { filename: 'test.bin', size: 1024 },
+        { filename: 'test.bin', size: 1024, ack: true },
         [mockPort2]
       );
     });
@@ -431,6 +431,111 @@ describe('createStreamingDownload', () => {
       expect(writer).toBeDefined();
       // No iframes should be created (no bridge, no download)
       expect(iframeCount).toBe(0);
+    });
+  });
+
+  describe('Flow control with a worker that reports progress', () => {
+    beforeEach(() => {
+      (globalThis as any).chrome = undefined;
+      Object.defineProperty(navigator, 'serviceWorker', {
+        value: { controller: { postMessage: vi.fn() } },
+        configurable: true,
+      });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const open = async (ack: boolean) => {
+      const promise = createStreamingDownload('test.bin');
+      await tick();
+      mockPort1.onmessage!(
+        new MessageEvent('message', {
+          data: ack ? { download: 'http://localhost/1/test.bin', ack: true } : { download: 'http://localhost/1/test.bin' },
+        })
+      );
+      return promise;
+    };
+    const fromWorker = (data: unknown) => mockPort1.onmessage!(new MessageEvent('message', { data }));
+    const settled = async (p: Promise<unknown>) => {
+      let state = false;
+      void p.then(() => {
+        state = true;
+      });
+      await tick();
+      return state;
+    };
+    const MB = 1024 * 1024;
+
+    it('close waits until the worker says the browser has the last byte', async () => {
+      const writer = await open(true);
+      await writer.write(new Uint8Array(10));
+      const closing = writer.close();
+      expect(await settled(closing)).toBe(false);
+      expect(mockPort1.postMessage).toHaveBeenCalledWith('end');
+      expect(mockPort1.close).not.toHaveBeenCalled();
+
+      fromWorker({ consumed: 10 });
+      expect(await settled(closing)).toBe(false);
+      fromWorker({ consumed: 10, done: true });
+      await closing;
+      expect(mockPort1.close).toHaveBeenCalled();
+    });
+
+    it('write waits while the browser is more than the limit behind', async () => {
+      const writer = await open(true);
+      await writer.write(new Uint8Array(8 * MB));
+      const second = writer.write(new Uint8Array(12 * MB));
+      expect(await settled(second)).toBe(false);
+
+      fromWorker({ consumed: 2 * MB });
+      expect(await settled(second)).toBe(false);
+      fromWorker({ consumed: 6 * MB });
+      await second;
+      expect(writer.bytesWritten).toBe(20 * MB);
+    });
+
+    it('a download cancelled in the browser releases a waiting write and close', async () => {
+      const writer = await open(true);
+      const write = writer.write(new Uint8Array(20 * MB));
+      expect(await settled(write)).toBe(false);
+      fromWorker({ abort: true });
+      await write;
+      await writer.close();
+      expect(mockPort1.close).toHaveBeenCalled();
+    });
+
+    it('a silent worker cannot hang close', async () => {
+      const writer = await open(true);
+      vi.useFakeTimers();
+      const closing = writer.close();
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(mockPort1.close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_000);
+      await closing;
+      expect(mockPort1.close).toHaveBeenCalled();
+    });
+
+    it('progress from the worker keeps a slow close waiting', async () => {
+      const writer = await open(true);
+      await writer.write(new Uint8Array(100));
+      vi.useFakeTimers();
+      const closing = writer.close();
+      await vi.advanceTimersByTimeAsync(25_000);
+      fromWorker({ consumed: 50 });
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(mockPort1.close).not.toHaveBeenCalled();
+      fromWorker({ consumed: 100, done: true });
+      await closing;
+      expect(mockPort1.close).toHaveBeenCalled();
+    });
+
+    it('an older worker gets the old behavior, no waiting', async () => {
+      const writer = await open(false);
+      await writer.write(new Uint8Array(40 * MB));
+      await writer.close();
+      expect(mockPort1.close).toHaveBeenCalled();
     });
   });
 
